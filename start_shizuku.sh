@@ -1,61 +1,90 @@
-# This script starts Shizuku. It is to be used with Termux:Boot to start Shizuku on boot.
-# 
-# Requires packages: nmap openssl android-tools
-# 
-# Also install package termux-api and Termux:API from F-Droid to provide status notifications.
-#
-# How to pair ADB server with device:
-# 1. Turn on Wireless debugging in settings
-# 2. Press "Pair device with pairing code"
-# 3. Open Termux in floating window/split-screen and enter the following command: adb pair localhost:[PORT] [CODE]
-#
-# I did not write this script, it was modified from a longer script by OP-san: https://github.com/RikkaApps/Shizuku/discussions/462
-
-
-
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Make a list of open ports
-echo Scanning ports...
-termux-notification-remove 1
-termux-notification -i 1 -t "Shizuku is starting..." --icon autorenew
 
-ports=$( nmap -sT -p30000-50000 --open localhost | grep "open" | cut -f1 -d/ )
+# Set to 1 to enable debugging mode.
+DEBUG=0
+LOGFILE=$(dirname $0)/log
+MAX_RETRIES=30
 
-# Go through the list of ports
-for port in ${ports}; do
-  
-    # Try to connect to the port, and save the result
-    result=$( adb connect "localhost:${port}" )
+debug() {
+    (( DEBUG )) && tee -a $LOGFILE <<< "$*"
+}
 
-    # Remove starting status notification
-    termux-notification-remove 1
+start_shizuku() {
 
-    # Try to start Shizuku even if connection wasn't established because Bash is fucky when run as a Termux task
-    adb shell "$( adb shell pm path moe.shizuku.privileged.api | sed 's/^package://;s/base\.apk/lib\/arm64\/libshizuku\.so/' )"
+    # Try to start Shizuku
+    libshizuku=$(adb shell pm path moe.shizuku.privileged.api | sed 's/^package://;s/base\.apk/lib\/arm64\/libshizuku\.so/')
+    shizuku_output=$(adb shell $libshizuku) 
+    debug "$shizuku_output"
 
     # Check if the connection succeeded
-    if [ $? = "0" ]; then
+    if [ "$shizuku_output" != "" ]; then
 
         # Tell the user about it
-        echo "${result}"
-        termux-notification -i 1 -t "Shizuku started!" --icon "done"
-    
+        termux-notification-remove 1 &
+        termux-notification -i 1 -t "Shizuku started!" --icon "done" &
+        debug "Shizuku has successfully started."
+
         # Disable wireless debugging, because it is not needed anymore
         adb shell settings put global adb_wifi_enabled 0
+        debug "Disabled wireless debugging."
+        debug "Exiting with 0!"
     
         exit 0
+    elif ((retries<MAX_RETRIES)); then
+        ((retries+=1)) 
+        debug "Failed to start. Retrying... ($retries)"
+        sleep 1
+        start_shizuku
     fi 
-done
+}
 
-# Error out if no working ports are found
-echo "I did not find any open ports. Maybe wireless debugging is disabled?"
-termux-notification \
-    -i 1 \
-    -t "Shizuku failed to start" \
-    --icon warning \
-    -c "Is wireless debugging enabled?" \
-    --button1 "Retry" \
-    --button1-action "bash -l -c \"termux-notification-remove 1; $HOME/.termux/boot/$(basename $0)\" "
+main() {
+    debug "$(date "+%Y-%m-%d %T")" 
+    termux-notification-remove 1 &
+    termux-notification -i 1 -t "Shizuku is starting..." --icon autorenew &
 
-exit 1
+    # Kill the adb server if it's running so it doesn't confuse other open ports for actual adb clients
+    adb kill-server
+
+    # Make a list of open ports
+    debug "Scanning for open ports..."
+    nmap_output=$(nmap -sT -p30000-50000 --open localhost)
+    ports=$(grep "open" <<< "$nmap_output" | cut -f1 -d/)
+    debug "$nmap_output"
+    debug "Found open port(s): $(tr "\n" " " <<< "$ports")"
+    debug "I'm going to try to connect to each port."
+
+    # Go through the list of ports
+    for port in ${ports}; do
+      
+        # Try to connect to the port, and save the result
+        debug "Trying port $port..." 
+        adb_output=$(adb connect "localhost:${port}")
+        debug "$adb_output"
+
+        # Check if the connection succeeded
+        if [[ "$adb_output" =~ "connected" || "$adb_output" =~ "already" ]];
+        then start_shizuku
+        else adb disconnect "localhost:${port}"
+        fi
+    done
+
+    # Error out if no working ports are found
+    debug "Either there were no ports, or the open ports I found were not correct."
+    debug "Is wireless debugging on? Try turning it off and on again."
+    debug "Exiting with 1."
+
+    termux-notification-remove 1 &
+    termux-notification \
+        -i 1 \
+        -t "Shizuku failed to start" \
+        --icon warning \
+        -c "Is wireless debugging enabled?" \
+        --button1 "Retry" \
+        --button1-action "bash -l -c  \"termux-notification-remove 1; $HOME/.termux/boot/$(basename $0)\"" &
+
+    exit 1 
+}
+
+main "$@"
